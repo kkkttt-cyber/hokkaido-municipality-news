@@ -6,6 +6,8 @@ import datetime as dt
 import requests
 from bs4 import BeautifulSoup
 from dateutil import tz
+from email.utils import parsedate_to_datetime
+import xml.etree.ElementTree as ET
 
 # =========================
 # Config
@@ -63,7 +65,6 @@ def notion_create(title: str, muni: str, link: str, published: dt.datetime | Non
 
     props = {
         "タイトル": {"title": [{"text": {"content": title[:200]}}]},
-        # 自治体は「テキスト（rich_text）」として投入（Selectにしたい場合は別途変更）
         "自治体": {"rich_text": [{"text": {"content": muni}}]},
         "URL": {"url": link},
         "取得日時": {"date": {"start": fetched.isoformat()}},
@@ -96,12 +97,17 @@ def parse_jp_date(text: str | None) -> dt.datetime | None:
     y, mo, d = map(int, m.groups())
     return dt.datetime(y, mo, d, 0, 0, 0, tzinfo=JST)
 
+def to_jst(d: dt.datetime) -> dt.datetime:
+    if d.tzinfo is None:
+        return d.replace(tzinfo=JST)
+    return d.astimezone(JST)
+
 # =========================
-# Collector (HTML)
+# Fetch (HTML/RSS common)
 # =========================
-def fetch_html(url: str) -> str | None:
+def fetch_text(url: str) -> str | None:
     """
-    取得に失敗しても例外で止めず None を返す（179自治体化で必須）
+    取得に失敗しても例外で止めず None を返す（多自治体化で必須）
     """
     try:
         r = requests.get(
@@ -115,12 +121,125 @@ def fetch_html(url: str) -> str | None:
     except Exception:
         return None
 
+def is_rss_url(url: str) -> bool:
+    u = url.lower()
+    return (
+        u.endswith(".rss")
+        or u.endswith(".rdf")
+        or u.endswith(".xml")
+        or "index.rss" in u
+        or "news.rss" in u
+    )
+
+# =========================
+# Collector (RSS)
+# =========================
+def parse_rss_date(text: str | None) -> dt.datetime | None:
+    """
+    RSSの日付をできるだけ解釈する
+    - pubDate: RFC822/1123 (email.utils.parsedate_to_datetime)
+    - dc:date / updated: ISO8601
+    """
+    if not text:
+        return None
+    t = text.strip()
+    # RFC822
+    try:
+        d = parsedate_to_datetime(t)
+        return to_jst(d)
+    except Exception:
+        pass
+    # ISO8601
+    try:
+        # Python 3.11: fromisoformat は 'Z' が苦手なので置換
+        t2 = t.replace("Z", "+00:00")
+        d = dt.datetime.fromisoformat(t2)
+        return to_jst(d)
+    except Exception:
+        return None
+
+def first_text(elem, candidates: list[str]) -> str | None:
+    """
+    candidates: ["title", "{namespace}date", ...] のいずれかで最初に見つかった文字列を返す
+    """
+    for tag in candidates:
+        found = elem.find(tag)
+        if found is not None and found.text:
+            return found.text.strip()
+    return None
+
+def collect_rss(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetched: dt.datetime) -> int:
+    xml_text = fetch_text(url)
+    if xml_text is None:
+        print(f"[WARN] {muni} fetch_failed url={url}")
+        return 0
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        print(f"[WARN] {muni} rss_parse_failed url={url}")
+        return 0
+
+    created = 0
+
+    # RSS: <rss><channel><item>...
+    # RDF: <rdf:RDF>...<item>...
+    items = root.findall(".//item")
+    if not items:
+        # Atom: <feed><entry>...
+        items = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+
+    for it in items:
+        # title
+        title = first_text(it, ["title", "{http://www.w3.org/2005/Atom}title"]) or ""
+        title = title.strip()
+        if not title:
+            continue
+
+        # link
+        link = first_text(it, ["link"])
+        if link is None:
+            # Atom link is attribute href
+            atom_link = it.find("{http://www.w3.org/2005/Atom}link")
+            if atom_link is not None:
+                link = atom_link.attrib.get("href")
+        if not link:
+            continue
+
+        # published date
+        pub = (
+            first_text(it, ["pubDate", "dc:date"])
+            or first_text(it, ["{http://purl.org/dc/elements/1.1/}date"])
+            or first_text(it, ["{http://www.w3.org/2005/Atom}updated"])
+            or first_text(it, ["{http://www.w3.org/2005/Atom}published"])
+        )
+        published = parse_rss_date(pub)
+
+        # 日付が取れない場合はスキップ（重複・ノイズ回避）
+        if published is None:
+            continue
+
+        # 期間フィルタ
+        if not (start <= published < end):
+            continue
+
+        try:
+            if notion_create(title, muni, link, published, fetched):
+                created += 1
+        except Exception as e:
+            print(f"[WARN] {muni} notion_failed link={link} err={e}")
+
+    return created
+
+# =========================
+# Collector (HTML)
+# =========================
 def collect_html(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetched: dt.datetime) -> int:
     """
     HTMLページ中のリンクを広く走査し、
     直前に現れる 'YYYY年M月D日' を発行日として採用。
     """
-    html = fetch_html(url)
+    html = fetch_text(url)
     if html is None:
         print(f"[WARN] {muni} fetch_failed url={url}")
         return 0
@@ -136,15 +255,12 @@ def collect_html(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetc
 
         link = requests.compat.urljoin(url, href)
 
-        # 直前の「YYYY年M月D日」らしき文字列を拾う
         prev_date_text = a.find_previous(string=DATE_RE)
         published = parse_jp_date(prev_date_text)
 
-        # 日付が取れないリンクはスキップ（ノイズが多いので）
         if published is None:
             continue
 
-        # 期間フィルタ
         if not (start <= published < end):
             continue
 
@@ -152,7 +268,6 @@ def collect_html(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetc
             if notion_create(title, muni, link, published, fetched):
                 created += 1
         except Exception as e:
-            # Notion側で落ちても、全体は止めない
             print(f"[WARN] {muni} notion_failed link={link} err={e}")
 
     return created
@@ -169,7 +284,6 @@ def read_sources(path: str) -> list[dict]:
     """
     with open(path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    # 必須列チェック
     for r in rows:
         if "muni" not in r or "url" not in r or not r["muni"] or not r["url"]:
             raise ValueError("sources.csv must have columns: muni,url and non-empty values")
@@ -186,7 +300,11 @@ def main():
         muni = row["muni"].strip()
         url = row["url"].strip()
 
-        c = collect_html(muni, url, start, end, fetched)
+        if is_rss_url(url):
+            c = collect_rss(muni, url, start, end, fetched)
+        else:
+            c = collect_html(muni, url, start, end, fetched)
+
         total_created += c
         print(f"[INFO] {muni} created={c}")
 
