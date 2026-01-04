@@ -1,0 +1,2 @@
+# hokkaido-municipality-news
+北海道内自治体の新着情報を毎朝自動収集してNotionに保存
