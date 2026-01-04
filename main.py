@@ -21,6 +21,9 @@ DATE_RE = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日")
 SOURCES_CSV = "sources.csv"
 USER_AGENT = "Mozilla/5.0 (compatible; HokkaidoNewsBot/1.0; +https://github.com/)"
 
+ATOM_NS = "http://www.w3.org/2005/Atom"
+DC_NS = "http://purl.org/dc/elements/1.1/"
+
 # =========================
 # Time window
 # =========================
@@ -102,6 +105,32 @@ def to_jst(d: dt.datetime) -> dt.datetime:
         return d.replace(tzinfo=JST)
     return d.astimezone(JST)
 
+def parse_rss_date(text: str | None) -> dt.datetime | None:
+    """
+    RSS/Atomの日付をできるだけ解釈する
+    - pubDate: RFC822/1123 (email.utils.parsedate_to_datetime)
+    - dc:date / updated / published: ISO8601
+    """
+    if not text:
+        return None
+    t = text.strip()
+
+    # RFC822/1123
+    try:
+        d = parsedate_to_datetime(t)
+        return to_jst(d)
+    except Exception:
+        pass
+
+    # ISO8601
+    try:
+        # Python 3.11: fromisoformat は 'Z' が苦手なので置換
+        t2 = t.replace("Z", "+00:00")
+        d = dt.datetime.fromisoformat(t2)
+        return to_jst(d)
+    except Exception:
+        return None
+
 # =========================
 # Fetch (HTML/RSS common)
 # =========================
@@ -132,35 +161,11 @@ def is_rss_url(url: str) -> bool:
     )
 
 # =========================
-# Collector (RSS)
+# RSS helpers
 # =========================
-def parse_rss_date(text: str | None) -> dt.datetime | None:
-    """
-    RSSの日付をできるだけ解釈する
-    - pubDate: RFC822/1123 (email.utils.parsedate_to_datetime)
-    - dc:date / updated: ISO8601
-    """
-    if not text:
-        return None
-    t = text.strip()
-    # RFC822
-    try:
-        d = parsedate_to_datetime(t)
-        return to_jst(d)
-    except Exception:
-        pass
-    # ISO8601
-    try:
-        # Python 3.11: fromisoformat は 'Z' が苦手なので置換
-        t2 = t.replace("Z", "+00:00")
-        d = dt.datetime.fromisoformat(t2)
-        return to_jst(d)
-    except Exception:
-        return None
-
 def first_text(elem, candidates: list[str]) -> str | None:
     """
-    candidates: ["title", "{namespace}date", ...] のいずれかで最初に見つかった文字列を返す
+    candidates のいずれかで最初に見つかった文字列を返す
     """
     for tag in candidates:
         found = elem.find(tag)
@@ -168,6 +173,66 @@ def first_text(elem, candidates: list[str]) -> str | None:
             return found.text.strip()
     return None
 
+def find_first_by_localname(elem, localname: str) -> str | None:
+    """
+    namespace有無に関係なく、タグの末尾が localname の要素を探して text を返す
+    例: <dc:date> / <pubDate> / <updated> などの揺れに強い
+    """
+    for child in elem.iter():
+        if isinstance(child.tag, str) and child.tag.endswith(localname):
+            if child.text and child.text.strip():
+                return child.text.strip()
+    return None
+
+def get_rss_link(it, feed_url: str) -> str | None:
+    """
+    RSS/RDF/Atom の link の揺れを吸収して URL を返す（絶対URL化もここで行う）
+    """
+    link = first_text(it, ["link"])
+
+    # Atom: <link href="...">
+    if not link:
+        atom_link = it.find(f"{{{ATOM_NS}}}link")
+        if atom_link is not None:
+            href = atom_link.attrib.get("href")
+            if href:
+                link = href.strip()
+
+    # RSS: <guid isPermaLink="true"> が実URLの場合
+    if not link:
+        guid = first_text(it, ["guid"])
+        if guid:
+            link = guid.strip()
+
+    if not link:
+        return None
+
+    return requests.compat.urljoin(feed_url, link)
+
+def get_rss_published(it) -> dt.datetime | None:
+    """
+    pubDate / dc:date / updated / published などを幅広く拾って datetime にする
+    """
+    # まずは典型タグ
+    pub = (
+        first_text(it, ["pubDate"])
+        or first_text(it, [f"{{{DC_NS}}}date"])
+        or first_text(it, [f"{{{ATOM_NS}}}updated"])
+        or first_text(it, [f"{{{ATOM_NS}}}published"])
+    )
+
+    # それでもダメなら localname 探索で拾う（dc:date 等を吸収）
+    if not pub:
+        for ln in ["pubDate", "date", "updated", "published"]:
+            pub = find_first_by_localname(it, ln)
+            if pub:
+                break
+
+    return parse_rss_date(pub)
+
+# =========================
+# Collector (RSS)
+# =========================
 def collect_rss(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetched: dt.datetime) -> int:
     xml_text = fetch_text(url)
     if xml_text is None:
@@ -176,8 +241,8 @@ def collect_rss(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetch
 
     try:
         root = ET.fromstring(xml_text)
-    except Exception:
-        print(f"[WARN] {muni} rss_parse_failed url={url}")
+    except Exception as e:
+        print(f"[WARN] {muni} rss_parse_failed url={url} err={e}")
         return 0
 
     created = 0
@@ -185,37 +250,25 @@ def collect_rss(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetch
     # RSS: <rss><channel><item>...
     # RDF: <rdf:RDF>...<item>...
     items = root.findall(".//item")
+
+    # Atom: <feed><entry>...
     if not items:
-        # Atom: <feed><entry>...
-        items = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+        items = root.findall(f".//{{{ATOM_NS}}}entry")
 
     for it in items:
         # title
-        title = first_text(it, ["title", "{http://www.w3.org/2005/Atom}title"]) or ""
+        title = first_text(it, ["title", f"{{{ATOM_NS}}}title"]) or ""
         title = title.strip()
         if not title:
             continue
 
-        # link
-        link = first_text(it, ["link"])
-        if link is None:
-            # Atom link is attribute href
-            atom_link = it.find("{http://www.w3.org/2005/Atom}link")
-            if atom_link is not None:
-                link = atom_link.attrib.get("href")
+        # link（揺れ対応 + 絶対URL化）
+        link = get_rss_link(it, url)
         if not link:
             continue
 
-        # published date
-        pub = (
-            first_text(it, ["pubDate", "dc:date"])
-            or first_text(it, ["{http://purl.org/dc/elements/1.1/}date"])
-            or first_text(it, ["{http://www.w3.org/2005/Atom}updated"])
-            or first_text(it, ["{http://www.w3.org/2005/Atom}published"])
-        )
-        published = parse_rss_date(pub)
-
-        # 日付が取れない場合はスキップ（重複・ノイズ回避）
+        # published（日付揺れ対応）
+        published = get_rss_published(it)
         if published is None:
             continue
 
