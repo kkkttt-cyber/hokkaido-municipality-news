@@ -32,9 +32,9 @@ def now_jst() -> dt.datetime:
 
 def window_24h(run_time: dt.datetime) -> tuple[dt.datetime, dt.datetime]:
     """
-    対象期間：前日 7:00 〜 当日 7:00（JST）
+    対象期間：前日 9:00 〜 当日 9:00（JST）
     """
-    end = run_time.replace(hour=7, minute=0, second=0, microsecond=0)
+    end = run_time.replace(hour=9, minute=0, second=0, microsecond=0)
     start = end - dt.timedelta(days=1)
     return start, end
 
@@ -89,9 +89,6 @@ def notion_create(title: str, muni: str, link: str, published: dt.datetime | Non
 # Parsing helpers
 # =========================
 def parse_jp_date(text: str | None) -> dt.datetime | None:
-    """
-    'YYYY年M月D日' を JST の 00:00 にして返す
-    """
     if not text:
         return None
     m = DATE_RE.search(text)
@@ -106,25 +103,17 @@ def to_jst(d: dt.datetime) -> dt.datetime:
     return d.astimezone(JST)
 
 def parse_rss_date(text: str | None) -> dt.datetime | None:
-    """
-    RSS/Atomの日付をできるだけ解釈する
-    - pubDate: RFC822/1123 (email.utils.parsedate_to_datetime)
-    - dc:date / updated / published: ISO8601
-    """
     if not text:
         return None
     t = text.strip()
 
-    # RFC822/1123
     try:
         d = parsedate_to_datetime(t)
         return to_jst(d)
     except Exception:
         pass
 
-    # ISO8601
     try:
-        # Python 3.11: fromisoformat は 'Z' が苦手なので置換
         t2 = t.replace("Z", "+00:00")
         d = dt.datetime.fromisoformat(t2)
         return to_jst(d)
@@ -132,21 +121,50 @@ def parse_rss_date(text: str | None) -> dt.datetime | None:
         return None
 
 # =========================
-# Fetch (HTML/RSS common)
+# Fetch (HTML/RSS common)  ★文字化け対策入り
 # =========================
+XML_DECL_RE = re.compile(br'^\s*<\?xml[^>]*encoding=["\']([^"\']+)["\']', re.I)
+
 def fetch_text(url: str) -> str | None:
     """
-    取得に失敗しても例外で止めず None を返す（多自治体化で必須）
+    取得に失敗しても例外で止めず None を返す。
+    RSS/XMLの文字化け対策として bytes で受けて encoding を推定して decode。
     """
     try:
-        r = requests.get(
-            url,
-            timeout=30,
-            headers={"User-Agent": USER_AGENT},
-        )
+        r = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
         if r.status_code != 200:
             return None
-        return r.text
+
+        content = r.content  # bytes
+
+        # 1) XML宣言の encoding を最優先で採用
+        m = XML_DECL_RE.search(content[:200])
+        if m:
+            enc = m.group(1).decode("ascii", errors="ignore") or None
+            if enc:
+                try:
+                    return content.decode(enc, errors="replace")
+                except Exception:
+                    pass
+
+        # 2) HTTPヘッダ由来（requestsが判定した encoding）
+        if r.encoding:
+            try:
+                return content.decode(r.encoding, errors="replace")
+            except Exception:
+                pass
+
+        # 3) 文字化け回避の保険（chardet/charset-normalizerが入っている環境なら効く）
+        try:
+            enc = r.apparent_encoding  # type: ignore
+            if enc:
+                return content.decode(enc, errors="replace")
+        except Exception:
+            pass
+
+        # 4) 最後にUTF-8
+        return content.decode("utf-8", errors="replace")
+
     except Exception:
         return None
 
@@ -164,9 +182,6 @@ def is_rss_url(url: str) -> bool:
 # RSS helpers
 # =========================
 def first_text(elem, candidates: list[str]) -> str | None:
-    """
-    candidates のいずれかで最初に見つかった文字列を返す
-    """
     for tag in candidates:
         found = elem.find(tag)
         if found is not None and found.text:
@@ -174,10 +189,6 @@ def first_text(elem, candidates: list[str]) -> str | None:
     return None
 
 def find_first_by_localname(elem, localname: str) -> str | None:
-    """
-    namespace有無に関係なく、タグの末尾が localname の要素を探して text を返す
-    例: <dc:date> / <pubDate> / <updated> などの揺れに強い
-    """
     for child in elem.iter():
         if isinstance(child.tag, str) and child.tag.endswith(localname):
             if child.text and child.text.strip():
@@ -185,12 +196,8 @@ def find_first_by_localname(elem, localname: str) -> str | None:
     return None
 
 def get_rss_link(it, feed_url: str) -> str | None:
-    """
-    RSS/RDF/Atom の link の揺れを吸収して URL を返す（絶対URL化もここで行う）
-    """
     link = first_text(it, ["link"])
 
-    # Atom: <link href="...">
     if not link:
         atom_link = it.find(f"{{{ATOM_NS}}}link")
         if atom_link is not None:
@@ -198,7 +205,6 @@ def get_rss_link(it, feed_url: str) -> str | None:
             if href:
                 link = href.strip()
 
-    # RSS: <guid isPermaLink="true"> が実URLの場合
     if not link:
         guid = first_text(it, ["guid"])
         if guid:
@@ -210,10 +216,6 @@ def get_rss_link(it, feed_url: str) -> str | None:
     return requests.compat.urljoin(feed_url, link)
 
 def get_rss_published(it) -> dt.datetime | None:
-    """
-    pubDate / dc:date / updated / published などを幅広く拾って datetime にする
-    """
-    # まずは典型タグ
     pub = (
         first_text(it, ["pubDate"])
         or first_text(it, [f"{{{DC_NS}}}date"])
@@ -221,7 +223,6 @@ def get_rss_published(it) -> dt.datetime | None:
         or first_text(it, [f"{{{ATOM_NS}}}published"])
     )
 
-    # それでもダメなら localname 探索で拾う（dc:date 等を吸収）
     if not pub:
         for ln in ["pubDate", "date", "updated", "published"]:
             pub = find_first_by_localname(it, ln)
@@ -247,32 +248,24 @@ def collect_rss(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetch
 
     created = 0
 
-    # RSS: <rss><channel><item>...
-    # RDF: <rdf:RDF>...<item>...
     items = root.findall(".//item")
-
-    # Atom: <feed><entry>...
     if not items:
         items = root.findall(f".//{{{ATOM_NS}}}entry")
 
     for it in items:
-        # title
         title = first_text(it, ["title", f"{{{ATOM_NS}}}title"]) or ""
         title = title.strip()
         if not title:
             continue
 
-        # link（揺れ対応 + 絶対URL化）
         link = get_rss_link(it, url)
         if not link:
             continue
 
-        # published（日付揺れ対応）
         published = get_rss_published(it)
         if published is None:
             continue
 
-        # 期間フィルタ
         if not (start <= published < end):
             continue
 
@@ -288,10 +281,6 @@ def collect_rss(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetch
 # Collector (HTML)
 # =========================
 def collect_html(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetched: dt.datetime) -> int:
-    """
-    HTMLページ中のリンクを広く走査し、
-    直前に現れる 'YYYY年M月D日' を発行日として採用。
-    """
     html = fetch_text(url)
     if html is None:
         print(f"[WARN] {muni} fetch_failed url={url}")
@@ -329,12 +318,6 @@ def collect_html(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetc
 # Main
 # =========================
 def read_sources(path: str) -> list[dict]:
-    """
-    sources.csv:
-    muni,url
-    北海道庁,https://www.pref.hokkaido.lg.jp/news/
-    ...
-    """
     with open(path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     for r in rows:
