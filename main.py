@@ -127,17 +127,18 @@ XML_DECL_RE = re.compile(br'^\s*<\?xml[^>]*encoding=["\']([^"\']+)["\']', re.I)
 
 def fetch_text(url: str) -> str | None:
     """
-    取得に失敗しても例外で止めず None を返す。
-    RSS/XMLの文字化け対策として bytes で受けて encoding を推定して decode。
+    RSS/XMLの文字化け対策：
+    - requestsの r.text に頼らず bytes で受ける
+    - XML宣言 encoding / HTTPヘッダ / apparent_encoding の順でdecode
     """
     try:
         r = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
         if r.status_code != 200:
             return None
 
-        content = r.content  # bytes
+        content = r.content
 
-        # 1) XML宣言の encoding を最優先で採用
+        # 1) XML宣言のencoding（例: Shift_JIS / UTF-8）
         m = XML_DECL_RE.search(content[:200])
         if m:
             enc = m.group(1).decode("ascii", errors="ignore") or None
@@ -147,14 +148,14 @@ def fetch_text(url: str) -> str | None:
                 except Exception:
                     pass
 
-        # 2) HTTPヘッダ由来（requestsが判定した encoding）
+        # 2) HTTPヘッダ由来
         if r.encoding:
             try:
                 return content.decode(r.encoding, errors="replace")
             except Exception:
                 pass
 
-        # 3) 文字化け回避の保険（chardet/charset-normalizerが入っている環境なら効く）
+        # 3) 推定
         try:
             enc = r.apparent_encoding  # type: ignore
             if enc:
@@ -198,6 +199,7 @@ def find_first_by_localname(elem, localname: str) -> str | None:
 def get_rss_link(it, feed_url: str) -> str | None:
     link = first_text(it, ["link"])
 
+    # Atom: <link href="...">
     if not link:
         atom_link = it.find(f"{{{ATOM_NS}}}link")
         if atom_link is not None:
@@ -205,6 +207,7 @@ def get_rss_link(it, feed_url: str) -> str | None:
             if href:
                 link = href.strip()
 
+    # RSS: <guid>がURLの場合
     if not link:
         guid = first_text(it, ["guid"])
         if guid:
