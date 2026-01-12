@@ -16,13 +16,28 @@ NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 DB_ID = os.environ["NOTION_DATABASE_ID"]
 
 JST = tz.gettz("Asia/Tokyo")
-DATE_RE = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日")
 
 SOURCES_CSV = "sources.csv"
-USER_AGENT = "Mozilla/5.0 (compatible; HokkaidoNewsBot/1.0; +https://github.com/)"
+USER_AGENT = "Mozilla/5.0 (compatible; HokkaidoNewsBot/1.1; +https://github.com/)"
+
+# Notion property names (DB側と一致させてください)
+PROP_TITLE = "タイトル"     # Title
+PROP_MUNI = "自治体"       # Rich text
+PROP_URL = "URL"           # URL
+PROP_FETCHED = "取得日時"  # Date
+PROP_PUB = "発行日"        # Date
+PROP_KEY = "重複キー"      # Rich text
+
+# Date regex (日本語/スラッシュ/ハイフン)
+DATE_RE_JP = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日")
+DATE_RE_SLASH = re.compile(r"(\d{4})[\/\.](\d{1,2})[\/\.](\d{1,2})")
+DATE_RE_DASH = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
 
 ATOM_NS = "http://www.w3.org/2005/Atom"
 DC_NS = "http://purl.org/dc/elements/1.1/"
+
+# RSSっぽさ判定（URLではなく中身で判定する）
+RSS_MARKERS = (b"<rss", b"<feed", b"<rdf", b"xmlns=\"http://www.w3.org/2005/Atom\"")
 
 # =========================
 # Time window
@@ -32,9 +47,9 @@ def now_jst() -> dt.datetime:
 
 def window_24h(run_time: dt.datetime) -> tuple[dt.datetime, dt.datetime]:
     """
-    対象期間：前日 9:00 〜 当日 9:00（JST）
+    対象期間：前日 0:00 〜 当日 0:00（JST）
     """
-    end = run_time.replace(hour=9, minute=0, second=0, microsecond=0)
+    end = run_time.replace(hour=0, minute=0, second=0, microsecond=0)
     start = end - dt.timedelta(days=1)
     return start, end
 
@@ -48,33 +63,48 @@ def notion_headers():
         "Notion-Version": "2022-06-28",
     }
 
-def dup_key(muni: str, url: str) -> str:
-    return hashlib.sha256(f"{muni}|{url}".encode("utf-8")).hexdigest()
+def to_jst(d: dt.datetime) -> dt.datetime:
+    if d.tzinfo is None:
+        return d.replace(tzinfo=JST)
+    return d.astimezone(JST)
+
+def safe_date_iso(d: dt.datetime | None) -> str:
+    return d.astimezone(JST).isoformat() if d else ""
+
+def dup_key(muni: str, url: str, published: dt.datetime | None, title: str) -> str:
+    """
+    ★積み重ねのための重複キー
+    - muni + url + 発行日(YYYY-MM-DD) + タイトル（先頭200）
+    → 同じURLでも「日付やタイトルが違えば別レコード」になり、日次で積み上がる
+    """
+    pub = published.date().isoformat() if published else ""
+    base = f"{muni}|{url}|{pub}|{title[:200]}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 def notion_exists(key: str) -> bool:
     r = requests.post(
         f"https://api.notion.com/v1/databases/{DB_ID}/query",
         headers=notion_headers(),
-        json={"filter": {"property": "重複キー", "rich_text": {"equals": key}}},
+        json={"filter": {"property": PROP_KEY, "rich_text": {"equals": key}}},
         timeout=30,
     )
     r.raise_for_status()
     return len(r.json().get("results", [])) > 0
 
 def notion_create(title: str, muni: str, link: str, published: dt.datetime | None, fetched: dt.datetime) -> bool:
-    key = dup_key(muni, link)
+    key = dup_key(muni, link, published, title)
     if notion_exists(key):
         return False
 
     props = {
-        "タイトル": {"title": [{"text": {"content": title[:200]}}]},
-        "自治体": {"rich_text": [{"text": {"content": muni}}]},
-        "URL": {"url": link},
-        "取得日時": {"date": {"start": fetched.isoformat()}},
-        "重複キー": {"rich_text": [{"text": {"content": key}}]},
+        PROP_TITLE: {"title": [{"text": {"content": title[:200]}}]},
+        PROP_MUNI: {"rich_text": [{"text": {"content": muni[:200]}}]},
+        PROP_URL: {"url": link},
+        PROP_FETCHED: {"date": {"start": fetched.isoformat()}},
+        PROP_KEY: {"rich_text": [{"text": {"content": key}}]},
     }
     if published is not None:
-        props["発行日"] = {"date": {"start": published.isoformat()}}
+        props[PROP_PUB] = {"date": {"start": published.isoformat()}}
 
     r = requests.post(
         "https://api.notion.com/v1/pages",
@@ -82,25 +112,90 @@ def notion_create(title: str, muni: str, link: str, published: dt.datetime | Non
         json={"parent": {"database_id": DB_ID}, "properties": props},
         timeout=30,
     )
+
+    # ★400などの原因をログに出す（函館の特定に使う）
+    if r.status_code >= 400:
+        print("[ERROR] notion_create_failed", r.status_code, r.text)
+
     r.raise_for_status()
     return True
 
 # =========================
-# Parsing helpers
+# Fetch (bytes decode)
 # =========================
-def parse_jp_date(text: str | None) -> dt.datetime | None:
+XML_DECL_RE = re.compile(br'^\s*<\?xml[^>]*encoding=["\']([^"\']+)["\']', re.I)
+
+def fetch_bytes(url: str) -> tuple[bytes | None, str | None]:
+    try:
+        r = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
+        if r.status_code != 200:
+            return None, None
+        ctype = r.headers.get("Content-Type")
+        return r.content, ctype
+    except Exception:
+        return None, None
+
+def decode_bytes(content: bytes, ctype: str | None) -> str:
+    """
+    文字化け対策：
+    - XML宣言 encoding / HTTPヘッダ / 推定 の順でdecode
+    """
+    # 1) XML宣言のencoding
+    m = XML_DECL_RE.search(content[:200])
+    if m:
+        enc = m.group(1).decode("ascii", errors="ignore") or None
+        if enc:
+            try:
+                return content.decode(enc, errors="replace")
+            except Exception:
+                pass
+
+    # 2) Content-Typeにcharsetがあれば拾う
+    if ctype and "charset=" in ctype.lower():
+        try:
+            enc = ctype.lower().split("charset=")[-1].split(";")[0].strip()
+            if enc:
+                return content.decode(enc, errors="replace")
+        except Exception:
+            pass
+
+    # 3) 最後にUTF-8
+    return content.decode("utf-8", errors="replace")
+
+def looks_like_rss(content: bytes, ctype: str | None) -> bool:
+    if ctype:
+        lc = ctype.lower()
+        if "xml" in lc or "rss" in lc or "atom" in lc:
+            return True
+    head = content.lstrip()[:800].lower()
+    return any(m in head for m in RSS_MARKERS)
+
+# =========================
+# Date parsing
+# =========================
+def parse_any_date(text: str | None) -> dt.datetime | None:
     if not text:
         return None
-    m = DATE_RE.search(text)
-    if not m:
+    t = str(text).strip()
+    if not t:
         return None
-    y, mo, d = map(int, m.groups())
-    return dt.datetime(y, mo, d, 0, 0, 0, tzinfo=JST)
 
-def to_jst(d: dt.datetime) -> dt.datetime:
-    if d.tzinfo is None:
-        return d.replace(tzinfo=JST)
-    return d.astimezone(JST)
+    m = DATE_RE_JP.search(t)
+    if m:
+        y, mo, d = map(int, m.groups())
+        return dt.datetime(y, mo, d, 0, 0, 0, tzinfo=JST)
+
+    m = DATE_RE_SLASH.search(t)
+    if m:
+        y, mo, d = map(int, m.groups())
+        return dt.datetime(y, mo, d, 0, 0, 0, tzinfo=JST)
+
+    m = DATE_RE_DASH.search(t)
+    if m:
+        y, mo, d = map(int, m.groups())
+        return dt.datetime(y, mo, d, 0, 0, 0, tzinfo=JST)
+
+    return None
 
 def parse_rss_date(text: str | None) -> dt.datetime | None:
     if not text:
@@ -119,65 +214,6 @@ def parse_rss_date(text: str | None) -> dt.datetime | None:
         return to_jst(d)
     except Exception:
         return None
-
-# =========================
-# Fetch (HTML/RSS common)  ★文字化け対策入り
-# =========================
-XML_DECL_RE = re.compile(br'^\s*<\?xml[^>]*encoding=["\']([^"\']+)["\']', re.I)
-
-def fetch_text(url: str) -> str | None:
-    """
-    RSS/XMLの文字化け対策：
-    - requestsの r.text に頼らず bytes で受ける
-    - XML宣言 encoding / HTTPヘッダ / apparent_encoding の順でdecode
-    """
-    try:
-        r = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
-        if r.status_code != 200:
-            return None
-
-        content = r.content
-
-        # 1) XML宣言のencoding（例: Shift_JIS / UTF-8）
-        m = XML_DECL_RE.search(content[:200])
-        if m:
-            enc = m.group(1).decode("ascii", errors="ignore") or None
-            if enc:
-                try:
-                    return content.decode(enc, errors="replace")
-                except Exception:
-                    pass
-
-        # 2) HTTPヘッダ由来
-        if r.encoding:
-            try:
-                return content.decode(r.encoding, errors="replace")
-            except Exception:
-                pass
-
-        # 3) 推定
-        try:
-            enc = r.apparent_encoding  # type: ignore
-            if enc:
-                return content.decode(enc, errors="replace")
-        except Exception:
-            pass
-
-        # 4) 最後にUTF-8
-        return content.decode("utf-8", errors="replace")
-
-    except Exception:
-        return None
-
-def is_rss_url(url: str) -> bool:
-    u = url.lower()
-    return (
-        u.endswith(".rss")
-        or u.endswith(".rdf")
-        or u.endswith(".xml")
-        or "index.rss" in u
-        or "news.rss" in u
-    )
 
 # =========================
 # RSS helpers
@@ -237,20 +273,17 @@ def get_rss_published(it) -> dt.datetime | None:
 # =========================
 # Collector (RSS)
 # =========================
-def collect_rss(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetched: dt.datetime) -> int:
-    xml_text = fetch_text(url)
-    if xml_text is None:
-        print(f"[WARN] {muni} fetch_failed url={url}")
-        return 0
+def collect_rss(muni: str, feed_url: str, content: bytes, ctype: str | None,
+                start: dt.datetime, end: dt.datetime, fetched: dt.datetime) -> int:
+    xml_text = decode_bytes(content, ctype)
 
     try:
         root = ET.fromstring(xml_text)
     except Exception as e:
-        print(f"[WARN] {muni} rss_parse_failed url={url} err={e}")
+        print(f"[WARN] {muni} rss_parse_failed url={feed_url} err={e}")
         return 0
 
     created = 0
-
     items = root.findall(".//item")
     if not items:
         items = root.findall(f".//{{{ATOM_NS}}}entry")
@@ -261,12 +294,13 @@ def collect_rss(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetch
         if not title:
             continue
 
-        link = get_rss_link(it, url)
+        link = get_rss_link(it, feed_url)
         if not link:
             continue
 
         published = get_rss_published(it)
         if published is None:
+            # RSSで発行日が取れない場合は、積み上げ運用の一貫性のためスキップ（必要ならここをfetchedに寄せてもOK）
             continue
 
         if not (start <= published < end):
@@ -283,26 +317,54 @@ def collect_rss(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetch
 # =========================
 # Collector (HTML)
 # =========================
-def collect_html(muni: str, url: str, start: dt.datetime, end: dt.datetime, fetched: dt.datetime) -> int:
-    html = fetch_text(url)
-    if html is None:
-        print(f"[WARN] {muni} fetch_failed url={url}")
-        return 0
+def extract_date_near_anchor(a) -> dt.datetime | None:
+    """
+    HTML用：リンク周辺（親要素・近傍テキスト）から日付を拾う
+    """
+    # 1) a自体のテキスト
+    d = parse_any_date(a.get_text(" ", strip=True))
+    if d:
+        return d
 
+    # 2) 親要素を数段さかのぼって、ブロック内テキストから拾う
+    node = a
+    for _ in range(4):
+        node = node.parent
+        if not node:
+            break
+        txt = node.get_text(" ", strip=True)
+        d = parse_any_date(txt)
+        if d:
+            return d
+
+    # 3) 直前のテキスト（現行のfind_previousより軽量）
+    prev = a.find_previous(string=True)
+    if prev:
+        d = parse_any_date(prev)
+        if d:
+            return d
+
+    # 4) 最後の手段：DATE_RE_JPが見える直前を探す
+    prev_jp = a.find_previous(string=DATE_RE_JP)
+    d = parse_any_date(prev_jp)
+    return d
+
+def collect_html(muni: str, page_url: str, content: bytes, ctype: str | None,
+                 start: dt.datetime, end: dt.datetime, fetched: dt.datetime) -> int:
+    html = decode_bytes(content, ctype)
     soup = BeautifulSoup(html, "html.parser")
+
     created = 0
 
-    for a in soup.select("a"):
-        title = a.get_text(strip=True)
+    for a in soup.select("a[href]"):
+        title = a.get_text(" ", strip=True)
         href = a.get("href")
         if not title or not href:
             continue
 
-        link = requests.compat.urljoin(url, href)
+        link = requests.compat.urljoin(page_url, href)
 
-        prev_date_text = a.find_previous(string=DATE_RE)
-        published = parse_jp_date(prev_date_text)
-
+        published = extract_date_near_anchor(a)
         if published is None:
             continue
 
@@ -335,14 +397,26 @@ def main():
     sources = read_sources(SOURCES_CSV)
 
     total_created = 0
+
     for row in sources:
         muni = row["muni"].strip()
         url = row["url"].strip()
 
-        if is_rss_url(url):
-            c = collect_rss(muni, url, start, end, fetched)
-        else:
-            c = collect_html(muni, url, start, end, fetched)
+        content, ctype = fetch_bytes(url)
+        if content is None:
+            print(f"[WARN] {muni} fetch_failed url={url}")
+            print(f"[INFO] {muni} created=0")
+            continue
+
+        # ★URLではなく「中身」でRSS/HTMLを自動判別する
+        try:
+            if looks_like_rss(content, ctype):
+                c = collect_rss(muni, url, content, ctype, start, end, fetched)
+            else:
+                c = collect_html(muni, url, content, ctype, start, end, fetched)
+        except Exception as e:
+            print(f"[WARN] {muni} collector_failed url={url} err={e}")
+            c = 0
 
         total_created += c
         print(f"[INFO] {muni} created={c}")
