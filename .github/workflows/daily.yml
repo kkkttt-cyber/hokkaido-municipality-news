@@ -2,7 +2,7 @@ name: Daily Hokkaido Municipality Updates
 
 on:
   schedule:
-    - cron: "0 0 * * *"  # 毎朝9:00（JST）※UTCで0:00
+    - cron: "0 15 * * *"  # 毎日 0:00（JST）= UTC 15:00
   workflow_dispatch:
 
 jobs:
